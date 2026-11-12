@@ -143,7 +143,9 @@ go test ./...      # 完整测试套件
 go run ./cmd/server -config config.json
 ```
 
-构建二进制：
+构建二进制（注意：`CGO_ENABLED=0 cmd` 这种「环境变量内联前缀」是 Unix shell 专属语法，**Windows CMD / PowerShell 不认**，会报「'CGO_ENABLED' 不是内部或外部命令」。三种 shell 写法不同）：
+
+**Git Bash / Linux / macOS**
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wb2api ./cmd/server
@@ -152,9 +154,43 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
 
+**Windows CMD**（`set "VAR=val"` 设置环境变量，再用 `&&` 串联；输出加 `.exe` 后缀；`-ldflags` 用空格分隔而非 `=`）：
+
+```cmd
+set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o wb2api.exe ./cmd/server
+set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o signin_bin.exe ./cmd/signin
+set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o login.exe ./cmd/login
+set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o credit.exe ./cmd/credit
+```
+
+**Windows PowerShell**（`$env:VAR="值"` 设置环境变量，用 `;` 串联）：
+
+```powershell
+$env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o wb2api.exe ./cmd/server
+$env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o signin_bin.exe ./cmd/signin
+$env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o login.exe ./cmd/login
+$env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o credit.exe ./cmd/credit
+```
+
+> Windows 下 `go build` 默认就会给输出加 `.exe`，写不写后缀都行；上面统一带 `.exe` 仅为直观。
+
 ### 启动网关（二进制）
 
 `go build` 产物是 `wb2api`（Windows 下为 `wb2api.exe`）。它**必须从项目根目录启动**——会读取当前工作目录下的 `config.json`（用 `-config <路径>` 可换位置）与 `auths/` 凭证目录，默认监听 `:7863`。原生二进制**不热加载**凭证，新增 / 更换账号后需重启网关（见下文「登录」）。
+
+> 🪟 **Windows 用户建议直接用仓库自带启动脚本** `start.bat` / `start.ps1`，它们已绕过下方提到的 PowerShell `Start-Process` 环境块 bug，并让服务脱离终端常驻（关窗口不断）。
+
+**Windows 一键启动助手**（自动 `cd` 到脚本所在目录、把参数透传给 `wb2api`、日志写入 `wb2api.log` / `wb2api.err`）：
+
+```cmd
+start.bat          # 命令行或双击运行（内部用 cmd 的 start）
+```
+
+```powershell
+.\start.ps1        # PowerShell 版，效果同上
+```
+
+> ⚠️ **PowerShell `Start-Process` 已知坑**：若环境里同时存在大小写重复的代理变量（如 `HTTPS_PROXY` 与 `https_proxy`、`HTTP_PROXY` 与 `http_proxy`），直接在 PowerShell 里 `Start-Process .\wb2api.exe` 会抛 `Start-Process : Item has already been added. Key in dictionary: 'HTTPS_PROXY' Key being added: 'https_proxy'`。根因：Windows 环境变量名大小写不敏感，而 .NET 构建子进程环境块用的是大小写不敏感字典，遇重复大小写直接异常（复现与机理见 https://pedroreys.com/post/npm-env-vars-windows ）。**规避方法**：用上面的 `start.bat` / `start.ps1`；或先 `Remove-Item Env:https_proxy` 清掉小写副本再 `Start-Process`；或改用 `cmd /c start "" wb2api.exe`。前台直接 `.\wb2api.exe` 运行不受影响。
 
 **前台启动**（占住当前终端，Ctrl+C 停止）：
 
