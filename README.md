@@ -192,6 +192,26 @@ start.bat          # 命令行或双击运行（内部用 cmd 的 start）
 
 > ⚠️ **PowerShell `Start-Process` 已知坑**：若环境里同时存在大小写重复的代理变量（如 `HTTPS_PROXY` 与 `https_proxy`、`HTTP_PROXY` 与 `http_proxy`），直接在 PowerShell 里 `Start-Process .\wb2api.exe` 会抛 `Start-Process : Item has already been added. Key in dictionary: 'HTTPS_PROXY' Key being added: 'https_proxy'`。根因：Windows 环境变量名大小写不敏感，而 .NET 构建子进程环境块用的是大小写不敏感字典，遇重复大小写直接异常（复现与机理见 https://pedroreys.com/post/npm-env-vars-windows ）。**规避方法**：用上面的 `start.bat` / `start.ps1`；或先 `Remove-Item Env:https_proxy` 清掉小写副本再 `Start-Process`；或改用 `cmd /c start "" wb2api.exe`。前台直接 `.\wb2api.exe` 运行不受影响。
 
+**看门狗（自动重启）**：`watchdog.ps1` / `start-watchdog.bat` 负责拉起 `wb2api` 并在其异常退出或假死时自动重启，适合长期无人值守运行：
+
+```cmd
+start-watchdog.bat           # 命令行或双击运行（内部绕过执行策略调用 watchdog.ps1）
+```
+
+```powershell
+.\watchdog.ps1               # 直接用 PowerShell 运行，可追加参数：
+.\watchdog.ps1 -Port 7863 -IntervalSec 5 -HangThreshold 3
+```
+
+重启语义（日志写入 `watchdog.log`）：
+- **进程退出** → 立即重启；
+- **进程在但 `/healthz` 连不上（假死）** 连续 `HangThreshold` 次 → 杀掉并重启（用死端口判定，避免误杀）；
+- **进程在但 `/healthz` 返回 503（账号 / 凭证不可用，非崩溃）** → 仅记录，**不重启**（避免无意义重启风暴）。
+
+> 看门狗自身若退出（含异常），本脚本不做任何自愈；如需关闭服务，结束看门狗即可，wb2api 会按 `-StopOnExit` 开关决定是否一并停止。
+>
+> ⚠️ **看门狗不接管手动已运行的实例**：启动看门狗前请先确保目标端口（默认 7863）**没有**已在运行的 `wb2api`，否则看门狗会再拉一个 → 端口冲突 → 子进程秒退 → 触发「秒退→重启」风暴。看门狗启动前会预检 `/healthz`，若端口已被占用会直接拒绝启动并提示。
+
 **前台启动**（占住当前终端，Ctrl+C 停止）：
 
 ```bash
