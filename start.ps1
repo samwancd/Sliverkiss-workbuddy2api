@@ -30,7 +30,15 @@ foreach ($lower in @('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'ftp_
 
 $log = Join-Path $dir 'wb2api.log'
 $err = Join-Path $dir 'wb2api.err'
-Start-Process -FilePath $exe -WorkingDirectory $dir -ArgumentList $args -RedirectStandardOutput $log -RedirectStandardError $err -WindowStyle Hidden
+$startArgs = @{
+    FilePath               = $exe
+    WorkingDirectory       = $dir
+    RedirectStandardOutput = $log
+    RedirectStandardError  = $err
+    WindowStyle            = 'Hidden'
+}
+if ($args.Count -gt 0) { $startArgs['ArgumentList'] = $args }
+Start-Process @startArgs
 
 Write-Host "已启动（日志 -> $log / $err）。关闭本窗口不影响服务运行。"
 Write-Host '验证： curl.exe -s http://127.0.0.1:7863/status -H "Authorization: Bearer test_key"'

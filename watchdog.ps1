@@ -60,9 +60,17 @@ function Write-Log {
 function Start-Child {
     $argList = @()
     if ($ConfigPath -ne '') { $argList += @('-config', $ConfigPath) }
+    $startArgs = @{
+        FilePath               = $exe
+        WorkingDirectory       = $dir
+        RedirectStandardOutput = $glog
+        RedirectStandardError  = $gerr
+        WindowStyle            = 'Hidden'
+        PassThru               = $true
+    }
+    if ($argList.Count -gt 0) { $startArgs['ArgumentList'] = $argList }
     try {
-        $p = Start-Process -FilePath $exe -WorkingDirectory $dir -ArgumentList $argList `
-            -RedirectStandardOutput $glog -RedirectStandardError $gerr -WindowStyle Hidden -PassThru
+        $p = Start-Process @startArgs
         Write-Log "拉起 wb2api pid=$($p.Id) 参数=[$($argList -join ' ')]"
         return $p
     } catch {
