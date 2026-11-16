@@ -201,14 +201,15 @@ start-watchdog.bat           # 命令行或双击运行（内部绕过执行策�
 ```powershell
 .\watchdog.ps1               # 直接用 PowerShell 运行，可追加参数：
 .\watchdog.ps1 -Port 7863 -IntervalSec 5 -HangThreshold 3
+.\watchdog.ps1 -KeepChild    # 退出时不清理 wb2api，留它在后台继续跑
 ```
 
 重启语义（日志写入 `watchdog.log`）：
 - **进程退出** → 立即重启；
-- **进程在但 `/healthz` 连不上（假死）** 连续 `HangThreshold` 次 → 杀掉并重启（用死端口判定，避免误杀）；
-- **进程在但 `/healthz` 返回 503（账号 / 凭证不可用，非崩溃）** → 仅记录，**不重启**（避免无意义重启风暴）。
+- **`/healthz` 返回任何 HTTP 状态码（含 503）** → 视为 gateway 进程仍在监听：不误判为假死、不重启；账号池不可用期间不在 watchdog 控制台刷屏。
+- **`/healthz` 完全连不上 / 超时** 连续 `HangThreshold` 次 → 判定假死，杀掉并重启（用死端口判定，避免误杀 HTTP 503）。
 
-> 看门狗自身若退出（含异常），本脚本不做任何自愈；如需关闭服务，结束看门狗即可，wb2api 会按 `-StopOnExit` 开关决定是否一并停止。
+> 看门狗退出时**默认一并停止**它拉起的 `wb2api`（正常退出走 `finally`，关窗口 / 被强杀则由 Windows Job Object 兜底回收），避免残留后台实例占住端口导致下次启动预检失败。若确需让 `wb2api` 留在后台，加 `-KeepChild`：`start-watchdog.bat -KeepChild`。
 >
 > ⚠️ **看门狗不接管手动已运行的实例**：启动看门狗前请先确保目标端口（默认 7863）**没有**已在运行的 `wb2api`，否则看门狗会再拉一个 → 端口冲突 → 子进程秒退 → 触发「秒退→重启」风暴。看门狗启动前会预检 `/healthz`，若端口已被占用会直接拒绝启动并提示。
 

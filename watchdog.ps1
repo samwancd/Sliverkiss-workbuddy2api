@@ -1,9 +1,12 @@
 ﻿# wb2api 看门狗（Windows PowerShell）
 # 职责：负责拉起 wb2api，并在其异常退出 / 假死时自动重启。
 #   - 进程退出 -> 立即重启
-#   - 进程在但 /healthz 连不上（假死）连续 HangThreshold 次 -> 杀掉并重启
-#   - 进程在但 /healthz 返回 503（账号/凭证问题，非崩溃）-> 仅记录，不重启（避免无意义重启风暴）
-# 看门狗自身若退出（含异常），本脚本不做任何自愈；如需关闭服务，结束本脚本即可。
+#   - 进程在但 /healthz 完全连不上（假死）连续 HangThreshold 次 -> 杀掉并重启
+#   - /healthz 返回任何 HTTP 状态码（含 503）视为端口有响应：不计入假死，循环中不打印
+# wb2api 的 stdout/stderr 合并写入 wb2api.log，方便实时查看连接日志。
+# 看门狗自身若退出（含异常）不做任何自愈；结束时默认一并停止它拉起的 wb2api，
+# 关窗口 / 强杀这类 finally 不执行的情况由 Job Object 兜底回收，避免残留实例占端口。
+# 确需保留后台实例时显式加 -KeepChild。
 # 启动前会先规范化代理环境变量（删除小写物理条目、保留值），绕开 PowerShell Start-Process
 # 在大小写重复代理变量下抛 Item has already been added 的已知问题（机理见 README 启动段）。
 
@@ -15,7 +18,7 @@ param(
     [int]   $IntervalSec = 5,
     [int]   $HangThreshold = 3,
     [int]   $HealthTimeoutSec = 5,
-    [switch]$StopOnExit
+    [switch]$KeepChild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +49,6 @@ foreach ($lower in @('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'ftp_
 
 $wlog  = Join-Path $dir 'watchdog.log'
 $glog  = Join-Path $dir 'wb2api.log'
-$gerr  = Join-Path $dir 'wb2api.err'
 $healthUrl = "http://127.0.0.1:$Port/healthz"
 
 function Write-Log {
@@ -57,26 +59,129 @@ function Write-Log {
     Write-Host $line
 }
 
+# Job Object（KILL_ON_JOB_CLOSE）：记着 cmd 包装进程与真实 wb2api。
+# 看门狗进程一消失（关窗口 / 被强杀 / 正常退出）句柄随之关闭，内核直接回收这两个进程，
+# 覆盖 finally 不执行的场景，避免残留实例占住端口让下次启动预检失败。
+function Initialize-JobObject {
+    if (-not ('Wb2api.Job' -as [type])) {
+        Add-Type -Namespace Wb2api -Name Job -MemberDefinition @'
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct IO_COUNTERS {
+    public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+    public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+}
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+    public uint LimitFlags;
+    public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+    public uint ActiveProcessLimit;
+    public UIntPtr Affinity;
+    public uint PriorityClass, SchedulingClass;
+}
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+    public IO_COUNTERS IoInfo;
+    public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+}
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)]
+static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint infoLen);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(IntPtr handle);
+public static IntPtr CreateKillOnCloseJob() {
+    IntPtr job = CreateJobObject(IntPtr.Zero, null);
+    if (job == IntPtr.Zero) { return IntPtr.Zero; }
+    var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+    info.BasicLimitInformation.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    int len = System.Runtime.InteropServices.Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+    IntPtr buf = System.Runtime.InteropServices.Marshal.AllocHGlobal(len);
+    try {
+        System.Runtime.InteropServices.Marshal.StructureToPtr(info, buf, false);
+        // JobObjectExtendedLimitInformation = 9
+        if (!SetInformationJobObject(job, 9, buf, (uint)len)) { CloseHandle(job); return IntPtr.Zero; }
+    } finally {
+        System.Runtime.InteropServices.Marshal.FreeHGlobal(buf);
+    }
+    return job;
+}
+'@
+    }
+    $job = [Wb2api.Job]::CreateKillOnCloseJob()
+    if ($job -eq [IntPtr]::Zero) {
+        Write-Log '警告：创建 Job Object 失败，看门狗被强杀 / 关窗口时可能残留 wb2api 进程'
+    }
+    return $job
+}
+
+function Join-JobObject {
+    param([IntPtr]$Job, $Target)
+    if ($null -eq $Target -or $Job -eq [IntPtr]::Zero) { return }
+    if ($Target.HasExited) { return }
+    try {
+        if (-not [Wb2api.Job]::AssignProcessToJobObject($Job, $Target.Handle)) {
+            $code = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Log "警告：pid=$($Target.Id) 未加入 Job Object（Win32 错误 $code），强杀时可能残留"
+        }
+    } catch {
+        Write-Log "警告：pid=$($Target.Id) 未加入 Job Object：$($_.Exception.Message)"
+    }
+}
+
 function Start-Child {
     $argList = @()
     if ($ConfigPath -ne '') { $argList += @('-config', $ConfigPath) }
+    # Go 的 log.Printf 走 stderr；用 cmd 把 stdout/stderr 合并进同一个 wb2api.log。
+    $exeArg = $exe -replace '"', '\"'
+    $logArg = $glog -replace '"', '\"'
+    $arguments = ''
+    if ($argList.Count -gt 0) {
+        foreach ($a in $argList) { $arguments += ' "' + ($a -replace '"', '\"') + '"' }
+    }
+    $launch = '"' + $exeArg + '"' + $arguments
+    $command = '( ' + $launch + ') > "' + $logArg + '" 2>&1'
     $startArgs = @{
-        FilePath               = $exe
+        FilePath               = $env:ComSpec
         WorkingDirectory       = $dir
-        RedirectStandardOutput = $glog
-        RedirectStandardError  = $gerr
+        ArgumentList           = @('/c', $command)
         WindowStyle            = 'Hidden'
         PassThru               = $true
     }
-    if ($argList.Count -gt 0) { $startArgs['ArgumentList'] = $argList }
     try {
-        $p = Start-Process @startArgs
-        Write-Log "拉起 wb2api pid=$($p.Id) 参数=[$($argList -join ' ')]"
+        $wrapper = Start-Process @startArgs
+        $childPid = $null
+        for ($i = 0; $i -lt 20 -and -not $childPid; $i++) {
+            $childPid = Get-ChildProcessId -Parent $wrapper
+            if (-not $childPid) { Start-Sleep -Milliseconds 100 }
+        }
+        if (-not $childPid) {
+            Write-Log "启动失败: 未找到 wb2api 子进程（cmd pid=$($wrapper.Id)）"
+            return $null
+        }
+        $p = Get-Process -Id $childPid -ErrorAction Stop
+        Join-JobObject -Job $job -Target $wrapper
+        Join-JobObject -Job $job -Target $p
+        Write-Log "拉起 wb2api pid=$($p.Id) 参数=[$($argList -join ' ')] 日志=$glog"
         return $p
     } catch {
         Write-Log "启动失败: $($_.Exception.Message)"
         return $null
     }
+}
+
+function Get-ChildProcessId {
+    param($Parent)
+    if ($null -eq $Parent) { return $null }
+    $name = [System.IO.Path]::GetFileName($exe)
+    try {
+        Get-CimInstance Win32_Process -Filter "ParentProcessId=$($Parent.Id)" |
+            Where-Object { $_.Name -eq $name } |
+            Select-Object -First 1 -ExpandProperty ProcessId
+    } catch { $null }
 }
 
 function Stop-Child {
@@ -86,11 +191,14 @@ function Stop-Child {
     }
 }
 
-# 干净退出时（Ctrl+C）按需停止子进程；看门狗自身退出不自愈，符合设计。
+# 干净退出时（Ctrl+C）默认停止子进程；加 -KeepChild 才保留后台实例。
+# $child 由主流程写、finally 读，均为脚本作用域，无需事件订阅。
+# -KeepChild 时连 Job 都不建：Windows 无法把进程移出 Job，一旦加入就会随看门狗被杀。
+# 用裸开关而非 -KeepChild:$false：start-watchdog.bat 以 powershell -File 调用，
+# 该形式下开关不认 :$false，会直接抛参数转换错误。
 $child = $null
-Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-    if ($StopOnExit -and $child) { try { $child.Kill() } catch {} }
-} | Out-Null
+$job = [IntPtr]::Zero
+if (-not $KeepChild) { $job = Initialize-JobObject }
 
 Write-Log "看门狗启动：bin=$exe port=$Port interval=${IntervalSec}s hangThreshold=$HangThreshold healthTimeout=${HealthTimeoutSec}s"
 Write-Log "健康检查端点 $healthUrl"
@@ -103,6 +211,16 @@ try {
     Write-Log "为避免重复拉起导致端口冲突重启风暴，请先停止已有实例，再启动看门狗。看门狗退出。"
     exit 2
 } catch {
+    $probeStatus = $null
+    if ($_.Exception.Response) {
+        try { $probeStatus = [int]$_.Exception.Response.StatusCode } catch {}
+    }
+    if ($null -ne $probeStatus) {
+        $statusText = if ($probeStatus -eq 503) { '账号池当前不可服务，服务已监听' } else { '服务已监听' }
+        Write-Log "/healthz 返回 HTTP $probeStatus（$statusText）：端口 $Port 已有 wb2api 实例。"
+        Write-Log "为避免重复拉起导致端口冲突重启风暴，请先停止已有实例，再启动看门狗。看门狗退出。"
+        exit 2
+    }
     Write-Log "端口 $Port 当前无运行实例，开始托管"
 }
 
@@ -138,14 +256,20 @@ try {
             continue
         }
 
-        # 2) 进程在 -> 探活。连不上才算假死，503 不算。
+        # 2) 进程在 -> 探活。只要收到 HTTP 响应（含 503）就算端口活着；
+        #    账号池不可服务期间不打印，避免每 5 秒刷屏误导。
         try {
-            $resp = Invoke-WebRequest -Uri $healthUrl -TimeoutSec $HealthTimeoutSec -UseBasicParsing -ErrorAction Stop
+            $null = Invoke-WebRequest -Uri $healthUrl -TimeoutSec $HealthTimeoutSec -UseBasicParsing -ErrorAction Stop
             $hangCount = 0
-            if ($resp.StatusCode -ne 200) {
-                Write-Log "/healthz 返回 $($resp.StatusCode)（账号/凭证不可用，非崩溃，不重启）"
-            }
         } catch {
+            $statusCode = $null
+            if ($_.Exception.Response) {
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+            }
+            if ($null -ne $statusCode) {
+                $hangCount = 0
+                continue
+            }
             $hangCount++
             Write-Log "/healthz 不可达（$($_.Exception.Message)）；假死疑似 $hangCount/$HangThreshold"
             if ($hangCount -ge $HangThreshold) {
@@ -162,10 +286,11 @@ try {
         }
     }
 } finally {
-    if ($StopOnExit -and $child) {
+    if ($KeepChild) {
+        # Job 已随进程退出关闭，不建 Job 时后台实例得以存活
+        Write-Log '看门狗退出（-KeepChild：wb2api 继续在后台运行，如需停止请手动结束进程）'
+    } elseif ($child) {
         Write-Log '看门狗退出，正在停止 wb2api'
         Stop-Child $child
-    } else {
-        Write-Log '看门狗退出（wb2api 继续在后台运行，如需停止请手动结束进程）'
     }
 }
