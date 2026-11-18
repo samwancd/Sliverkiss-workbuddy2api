@@ -102,15 +102,19 @@ flowchart LR
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
-## 快速开始
+## 快速开始：按这个顺序走
+
+> 先记住一条主线：**准备 → 登录 → 启动 → 验证**。网关只提供 API 服务，不会替你完成 OAuth 登录，也不会自动运行 `login` / `signin_bin` / `credit`。
 
 ### 环境要求
 
-- **Docker + Docker Compose**（推荐部署方式，镜像内已含 `app` 低权限用户与全部工具脚本）
+- **Docker + Docker Compose**（推荐部署方式，镜像内已含 `app` 低权限用户、网关二进制与工具脚本）
+- 或 **Windows + Go ≥ 1.22**（用仓库自带的 `.bat` / `.ps1` 直接跑本机编译的二进制）
 - 一个或多个已注册的 CodeBuddy 账号，用于 OAuth 登录
-- 宿主机 Go ≥ 1.22（仅源码构建时需要）
 
-### Docker Compose 一键部署
+### 第 1 步：准备文件与构建产物
+
+**Docker / Linux / macOS**：
 
 ```bash
 git clone https://github.com/Sliverkiss/workbuddy2api.git
@@ -120,154 +124,52 @@ cp config.example.json config.json
 
 编辑 `config.json`，**至少设置 `api_key`**（`留空 = 不鉴权`，公网部署务必设置）。示例中的 `test_key` 等均为占位符，`config.example.json` 不含任何真实密钥。
 
-```bash
-# 登录添加账号（重复执行可加多号）
-./login.sh
-
-# 启动服务
-docker compose up -d --build
-
-# 健康检查（无可用账号时 503）；service 字段用于确认打到的是本网关
-curl -s http://localhost:7863/healthz
-# {"healthy":2,"total":3,"service":"workbuddy2api"}
-```
-
-`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + `auths/workbuddy-<uid>.json` 落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
-
-### 源码构建
-
-```bash
-go build ./...
-go vet ./...
-go test ./...      # 完整测试套件
-go run ./cmd/server -config config.json
-```
-
-构建二进制（注意：`CGO_ENABLED=0 cmd` 这种「环境变量内联前缀」是 Unix shell 专属语法，**Windows CMD / PowerShell 不认**，会报「'CGO_ENABLED' 不是内部或外部命令」。三种 shell 写法不同）：
+**Windows 二进制**：同样先准备好 `config.json`，然后构建下面四个工具（三种 shell 任选其一；`CGO_ENABLED=0 命令` 这种「环境变量内联前缀」是 Unix shell 专属语法，**Windows CMD / PowerShell 不认**，会报「'CGO_ENABLED' 不是内部或外部命令」）。Linux 下 `./login.sh` 会在首次运行时自动编译 `./login`（源码改动后需手动 `go build -o login ./cmd/login`）：
 
 **Git Bash / Linux / macOS**
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wb2api ./cmd/server
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
 ```
 
 **Windows CMD**（`set "VAR=val"` 设置环境变量，再用 `&&` 串联；输出加 `.exe` 后缀；`-ldflags` 用空格分隔而非 `=`）：
 
 ```cmd
 set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o wb2api.exe ./cmd/server
-set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o signin_bin.exe ./cmd/signin
 set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o login.exe ./cmd/login
 set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o credit.exe ./cmd/credit
+set "CGO_ENABLED=0" && go build -trimpath -ldflags "-s -w" -o signin_bin.exe ./cmd/signin
 ```
 
 **Windows PowerShell**（`$env:VAR="值"` 设置环境变量，用 `;` 串联）：
 
 ```powershell
 $env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o wb2api.exe ./cmd/server
-$env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o signin_bin.exe ./cmd/signin
 $env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o login.exe ./cmd/login
 $env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o credit.exe ./cmd/credit
+$env:CGO_ENABLED="0"; go build -trimpath -ldflags "-s -w" -o signin_bin.exe ./cmd/signin
 ```
 
-> Windows 下 `go build` 默认就会给输出加 `.exe`，写不写后缀都行；上面统一带 `.exe` 仅为直观。
+> Windows 下 `go build` 默认就会给输出加 `.exe`，写不写后缀都行；上面统一带 `.exe` 仅为直观。第一次用只需要 `wb2api` + `login`；`credit` / `signin_bin` 是后面「辅助工具」才用得到的可选产物。
 
-### 启动网关（二进制）
+### 第 2 步：登录一次，添加账号
 
-`go build` 产物是 `wb2api`（Windows 下为 `wb2api.exe`）。它**必须从项目根目录启动**——会读取当前工作目录下的 `config.json`（用 `-config <路径>` 可换位置）与 `auths/` 凭证目录，默认监听 `:7863`。原生二进制**不热加载**凭证，新增 / 更换账号后需重启网关（见下文「登录」）。
+> 网关**只在启动时扫描 `auths/` 凭证目录**（`cmd/server/main.go` 的 `auth.LoadDir`），原生二进制不热加载。因此**首次使用必须先登录再启动**；如果已经启动了网关，登录后必须重启一次。
 
-> 🪟 **Windows 用户建议直接用仓库自带启动脚本** `start.bat` / `start.ps1`，它们已绕过下方提到的 PowerShell `Start-Process` 环境块 bug，并让服务脱离终端常驻（关窗口不断）。
-
-**Windows 一键启动助手**（自动 `cd` 到脚本所在目录、把参数透传给 `wb2api`、日志写入 `wb2api.log` / `wb2api.err`）：
-
-```cmd
-start.bat          # 命令行或双击运行（内部用 cmd 的 start）
-```
-
-```powershell
-.\start.ps1        # PowerShell 版，效果同上
-```
-
-> ⚠️ **PowerShell `Start-Process` 已知坑**：若环境里同时存在大小写重复的代理变量（如 `HTTPS_PROXY` 与 `https_proxy`、`HTTP_PROXY` 与 `http_proxy`），直接在 PowerShell 里 `Start-Process .\wb2api.exe` 会抛 `Start-Process : Item has already been added. Key in dictionary: 'HTTPS_PROXY' Key being added: 'https_proxy'`。根因：Windows 环境变量名大小写不敏感，而 .NET 构建子进程环境块用的是大小写不敏感字典，遇重复大小写直接异常（复现与机理见 https://pedroreys.com/post/npm-env-vars-windows ）。**规避方法**：用上面的 `start.bat` / `start.ps1`；或先 `Remove-Item Env:https_proxy` 清掉小写副本再 `Start-Process`；或改用 `cmd /c start "" wb2api.exe`。前台直接 `.\wb2api.exe` 运行不受影响。
-
-**看门狗（自动重启）**：`watchdog.ps1` / `start-watchdog.bat` 负责拉起 `wb2api` 并在其异常退出或假死时自动重启，适合长期无人值守运行：
-
-```cmd
-start-watchdog.bat           # 命令行或双击运行（内部绕过执行策略调用 watchdog.ps1）
-```
-
-```powershell
-.\watchdog.ps1               # 直接用 PowerShell 运行，可追加参数：
-.\watchdog.ps1 -Port 7863 -IntervalSec 5 -HangThreshold 3
-.\watchdog.ps1 -KeepChild    # 退出时不清理 wb2api，留它在后台继续跑
-```
-
-重启语义（日志写入 `watchdog.log`）：
-- **进程退出** → 立即重启；
-- **`/healthz` 返回任何 HTTP 状态码（含 503）** → 视为 gateway 进程仍在监听：不误判为假死、不重启；账号池不可用期间不在 watchdog 控制台刷屏。
-- **`/healthz` 完全连不上 / 超时** 连续 `HangThreshold` 次 → 判定假死，杀掉并重启（用死端口判定，避免误杀 HTTP 503）。
-
-> 看门狗退出时**默认一并停止**它拉起的 `wb2api`（正常退出走 `finally`，关窗口 / 被强杀则由 Windows Job Object 兜底回收），避免残留后台实例占住端口导致下次启动预检失败。若确需让 `wb2api` 留在后台，加 `-KeepChild`：`start-watchdog.bat -KeepChild`。
->
-> ⚠️ **看门狗不接管手动已运行的实例**：启动看门狗前请先确保目标端口（默认 7863）**没有**已在运行的 `wb2api`，否则看门狗会再拉一个 → 端口冲突 → 子进程秒退 → 触发「秒退→重启」风暴。看门狗启动前会预检 `/healthz`，若端口已被占用会直接拒绝启动并提示。
-
-**前台启动**（占住当前终端，Ctrl+C 停止）：
+**Docker / Linux / macOS**：
 
 ```bash
-# Git Bash / Linux
-cd /path/to/workbuddy2api
-./wb2api                 # 等价于 ./wb2api -config config.json
+./login.sh                  # 交互式选域，默认国内版 cn
+./login.sh --realm=cn       # 直达国内版
+./login.sh --realm=global   # 直达国际版
 ```
 
-```powershell
-# PowerShell（Windows，若 Git Bash 构建产物不带 .exe 后缀则去掉 .exe）
-cd D:\path\to\workbuddy2api
-.\wb2api.exe
-```
+脚本会打印一个授权链接；在浏览器里打开后，**扫码或手机号登录任选一种**完成授权，再回到终端按 `y`。脚本随后轮询 token、写入 `auths/workbuddy-<uid>.json`；若容器已在运行会自动 `docker restart` 加载新账号，否则等下次启动自然加载。重复执行 `./login.sh` 即可继续添加多个账号。
 
-**后台启动（推荐，落日志便于排查）**：
-
-```bash
-# Git Bash
-cd /path/to/workbuddy2api
-./wb2api > wb2api.log 2>&1 &
-```
-
-```powershell
-# PowerShell：Start-Process 非阻塞启动，stdout/stderr 分别落盘
-cd D:\path\to\workbuddy2api
-Start-Process -FilePath ".\wb2api.exe" -RedirectStandardOutput "wb2api.log" -RedirectStandardError "wb2api.err"
-```
-
-**验证启动成功**：
-
-```bash
-# 账号池状态（需鉴权，healthy > 0 即账号已加载）
-curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
-# 或免鉴权的健康检查
-curl -s http://localhost:7863/healthz
-```
-
-**停止服务**：
-
-```powershell
-Stop-Process -Name wb2api          # PowerShell
-```
-```bash
-pkill -f wb2api                     # Git Bash / Linux
-```
-
-> ⚠️ `wb2api` 是常驻前台进程：**关闭终端、注销、重启电脑都会让它退出**。进程意外退出后直接重跑上面的启动命令即可，无需重新登录；除非 `/status` 中账号变为 `disabled`（此时需按「登录」重新授权并重启）。
-
-### Windows 下运行工具（无 Linux 环境）
-
-仓库里的 `*.sh` 是 bash 脚本，Windows 无法直接运行；它们只是对仓库内 Go 原生二进制（`login` / `signin_bin` / `credit`）的封装。**在 Windows 上直接用对应的 `.exe` 即可**——`go build` 在 Windows 下产物自带 `.exe` 后缀。PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，但 `login.exe` 等是程序本体，正常调用即可。
-
-> 注：若你在 Git Bash 下构建，产物可能不带 `.exe` 后缀，命令里去掉 `.exe` 即可（如 `./login`、`signin_bin`）。
-
-**登录（添加账号）** —— 分两步，中间需你在浏览器完成扫码 / 授权：
+**Windows（PowerShell）** —— 同样分两步，中间在浏览器完成**扫码或手机号登录**：
 
 ```powershell
 # 1) 取授权链接（realm 可选 cn / global；不传回落 cn）
@@ -298,23 +200,130 @@ New-Item -ItemType Directory -Force -Path auths | Out-Null
 Write-Host "已保存 auths/workbuddy-$uid.json"
 ```
 
-> 登录后**必须重启网关**才能加载新账号：原生二进制不热加载凭证（仅在启动时扫描 `auths/`）。停掉 `wb2api` 进程后重新 `.\wb2api.exe -config config.json` 即可，无需像脚本那样 `docker restart`。CN 首次签到可省略，网关内置 09 / 21 点定时签到。
+仓库里的 `*.sh` 是 bash 脚本，Windows 无法直接运行；它们只是对 `login` / `signin_bin` / `credit` 的封装，Windows 直接用对应的 `.exe` 即可。若你在 Git Bash 下构建，产物可能不带 `.exe` 后缀，命令里去掉即可（如 `./login`、`signin_bin`）。CN 账号首次签到可省略，网关内置 09 / 21 点定时签到。
 
-**签到（批量）** —— 遍历 `auths/` 下所有账号执行签到：
+### 第 3 步：启动网关
 
-```powershell
-signin_bin.exe            # 默认目录 auths
-# 或指定目录：signin_bin.exe D:\path\to\auths
+**Docker**：
+
+```bash
+docker compose up -d --build
 ```
 
-**积分日报** —— 查看各账号积分：
+**Windows 二进制**（二选一，不要两个同时跑）：
 
-```powershell
-credit.exe -pretty       # 人类可读日报（默认）
-credit.exe               # 原始 JSON
+```cmd
+start.bat              :: 简单常驻，脱离终端，日志 wb2api.log / wb2api.err
+start-watchdog.bat     :: 看门狗，进程退出或假死时自动重启，日志 watchdog.log
 ```
 
-### 验证
+```powershell
+.\start.ps1            :: start.bat 的 PowerShell 等价版
+.\watchdog.ps1         :: 看门狗本体，可加 -Port 7863 -IntervalSec 5 -HangThreshold 3
+```
+
+`start.bat` 只拉起 `wb2api.exe` 并把参数透传；看门狗也只托管 `wb2api.exe`（进程退出立即重启，`/healthz` 连续 `HangThreshold` 次完全连不上才判定假死并重启；**含 503 的任何 HTTP 响应都算「还活着」，不重启**）。两个启动脚本都**不会**调用 login / credit / signin，也不需要你手动跑这些工具才能启动服务。
+
+> ⚠️ **看门狗不接管手动已运行的实例**：启动前确保 7863 端口没有已在运行的 `wb2api`，否则看门狗预检会直接拒绝启动，避免端口冲突造成「秒退→重启」风暴。看门狗默认退出时一并停止它拉起的 `wb2api`；要留后台实例加 `-KeepChild`（`start-watchdog.bat -KeepChild`）。
+
+**不使用脚本的启动方式**（前台占住终端 / 后台落日志）：
+
+```bash
+cd /path/to/workbuddy2api
+./wb2api                          # 前台，Ctrl+C 停止
+./wb2api > wb2api.log 2>&1 &      # Git Bash 后台
+```
+
+```powershell
+cd D:\path\to\workbuddy2api
+.\wb2api.exe                     # 前台，Ctrl+C 停止
+Start-Process -FilePath ".\wb2api.exe" -RedirectStandardOutput "wb2api.log" -RedirectStandardError "wb2api.err"
+```
+
+> 🪟 **PowerShell `Start-Process` 已知坑**：若环境里同时存在大小写重复的代理变量（如 `HTTPS_PROXY` 与 `https_proxy`），直接 `Start-Process .\wb2api.exe` 会抛 `Item has already been added`；根因是 Windows 环境变量名大小写不敏感而 .NET 用大小写不敏感字典构建子进程环境块。**优先用 `start.bat` / `start.ps1`**；或先 `Remove-Item Env:https_proxy` 清掉小写副本，或改用 `cmd /c start "" wb2api.exe`。前台直接 `.\wb2api.exe` 不受影响。
+
+### 第 4 步：验证
+
+```bash
+curl -s http://localhost:7863/healthz
+# {"healthy":2,"total":3,"service":"workbuddy2api"}  （无可用账号时 503）
+
+curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+# healthy > 0 即账号已加载；disabled 账号会透出 disabled_reason
+```
+
+> **Windows 提示**：PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，调用真正的 curl 必须写 `curl.exe`（Windows 10 / 11 已内置）。
+
+### 以后怎么用 / 什么时候要重新登录
+
+**日常只需要第 3 步**：进程退出、关机、看门狗重启后，重跑启动脚本即可，**不用重新登录**。网关会自动做 token 刷新（请求前临近过期就刷，另有 22 点全账号保活）、09 / 21 点签到与余额查询、活跃上报、猫猫旅行等定时任务；这些都由 `wb2api` 内置完成，**不需要也不自动运行** `credit.exe` / `signin_bin.exe`。
+
+只有在以下情况才重跑第 2 步，并重启网关加载新凭证（原生二进制不热加载）：
+
+- 新增账号，或更换账号凭证；
+- `/status` 中账号 `disabled` 且 `disabled_reason` 出现 `12153 session dead`、`re-login required`（如 `11140 request illegal`）；
+- 日志出现 `refresh_failed ... re-login required`。
+
+`/healthz` 返回 503 只表示「服务还活着但账号池暂时不可服务」，不是重登信号；看门狗也会把它当作存活，不会重启。
+
+### 辅助工具：手动查积分 / 手动补签（可选，不属于启动流程）
+
+先分清「自动」和「手动」：网关 `wb2api` 内置定时任务，每天 09 / 21 点自动给所有账号签到并查余额、22 点自动刷新 token（见「定时积分任务」）。下面两个 `.exe` 是**同功能的一次性手动版本**：不会开机自启，也不被 `start.bat` / `start-watchdog.bat` / 网关调用，**从来不运行它们也完全不影响正常使用**。仓库根目录的 `*.exe` 是本机 `go build` 产物、被 `.gitignore` 忽略，不随仓库分发。
+
+#### `credit.exe` —— 积分日报（只看不改）
+
+- **干什么**：遍历 `auths/workbuddy-*.json`，逐个查询上游积分，输出每个账号的「剩余 / 已用 / 总额 / 积分包数 / 是否查询成功」以及全体合计。**纯只读**：不改 auth 文件、不签到、不消耗积分。
+- **什么时候用**：
+  - 想立刻知道各账号还剩多少积分、哪个号快耗尽；
+  - 核对网关 `/status` 里的积分数字是否与上游一致（对账）；
+  - 刚加完账号或刚领完活动加油包，确认积分是否到账；
+  - 出现 402「余额不足」冷却时，确认是全体没额度还是个别号没额度。
+- **怎么用**：`credit.exe -pretty`（人类可读日报）或 `credit.exe`（默认原始 JSON，便于脚本解析）；Linux / 容器用 `./credit.sh`（默认美化）、`./credit.sh -json`（原始 JSON）。可用环境变量 `WB2A_AUTH_DIR` 改凭证目录。
+
+#### `signin_bin.exe` —— 批量签到（会写回 token）
+
+- **干什么**：遍历 `auths/workbuddy-*.json`，对每个账号依次：token 快过期（2 小时内）先自动刷新并**写回 auth 文件** → 调每日签到（幂等，「今天已签到」显示为 `ALREADY`，不算失败）→ 顺带回读余额；最后打印 `uid | nick | status | remain | detail` 表格与汇总。`status` 为 `OK` / `ALREADY` / `FAIL` / `AUTH_INVALID` / `LOAD_ERR` 之一，可直接看出哪个号签到失败或凭证已失效。
+- **什么时候用**：
+  - 刚登录完新账号，想立刻领当天签到，不想等下一个 09 / 21 点整点；
+  - 定时签到那两个时点机器没开机，或关掉了 `schedule.checkin_enabled`，需要手动补签；
+  - 怀疑某号签到失败，跑一次看 `status` / `detail` 里的上游报错；
+  - 长期关机后重新开机，想手动刷新一批快过期的 token 并落盘。
+- **怎么用**：`signin_bin.exe`（默认读 `auths`）或 `signin_bin.exe D:\path\to\auths`；Linux / 容器用 `./signin.sh [auths_dir]`，`./checkin.sh` 会额外打印 `/status` 网关状态头、并在缺失时自动编译 `signin_bin`。
+- **注意**：它只改磁盘上的 auth 文件、**不重启网关**。已在运行的网关持有自己那份账号状态，会按请求自动刷新 token，两者不会冲突；新增账号仍要走第 2 步并重启。
+
+#### `login` / `login.exe`
+
+只在第 2 步添加账号、或上一节「什么时候要重新登录」重登时用，不是日常工具。用法见第 2 步。
+
+| 速查 | Windows | Linux / 容器 |
+| --- | --- | --- |
+| 查积分 | `credit.exe -pretty` / `credit.exe`（JSON） | `./credit.sh` / `./credit.sh -json` |
+| 手动补签 | `signin_bin.exe [auths目录]` | `./signin.sh [auths目录]` / `./checkin.sh` |
+| 登录 / 重登 | `login.exe --realm=cn url` → `poll` | `./login.sh [--realm=cn&#124;global]` |
+
+### 源码构建与测试（开发者）
+
+```bash
+go build ./...
+go vet ./...
+go test ./...      # 完整测试套件
+go run ./cmd/server -config config.json
+```
+
+`go build` 产物是 `wb2api`（Windows 下为 `wb2api.exe`）。它**必须从项目根目录启动**——会读取当前工作目录下的 `config.json`（用 `-config <路径>` 可换位置）与 `auths/` 凭证目录，默认监听 `:7863`。
+
+**停止服务**：
+
+```powershell
+Stop-Process -Name wb2api          # PowerShell
+```
+```bash
+pkill -f wb2api                     # Git Bash / Linux
+```
+
+> ⚠️ `wb2api` 是常驻前台进程：**关闭终端、注销、重启电脑都会让它退出**（用 `start.bat` / `start-watchdog.bat` 可避免）。
+
+## 验证：调用 OpenAI 兼容接口
 
 ```bash
 # 模型列表
@@ -334,6 +343,7 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+```
 
 > **Windows 提示**：PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，**必须用 `curl.exe`** 调用真正的 curl 程序；Windows 10 / 11 已内置 curl（cmd 与 PowerShell 均可直接用）。下面给出与上方等价的 Windows 写法。
 
@@ -399,7 +409,7 @@ curl.exe --% -s http://localhost:7863/v1/chat/completions -H "Authorization: Bea
 ### 发布来源与合规边界
 
 - **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
-- 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`（Linux / 容器环境）。这三个脚本均为 Go 原生二进制（`login` / `signin_bin` / `credit`）的薄封装，**Windows 无 Linux 环境时无需跑 `.sh`，直接调用对应的 `.exe` 即可**，详见下方「Windows 下运行工具（无 Linux 环境）」。
+- 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`（Linux / 容器环境）。这三个脚本均为 Go 原生二进制（`login` / `signin_bin` / `credit`）的薄封装，**Windows 无 Linux 环境时无需跑 `.sh`，直接调用对应的 `.exe` 即可**，用法见「快速开始」第 2 步与「辅助工具」。
 - **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
 - 上游 CodeBuddy 属第三方商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
